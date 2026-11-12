@@ -48,7 +48,7 @@ flowchart LR
     S --> D[(SQLite)]
     S --> V[HTML 字符串渲染]
     V --> B
-    R --> L[/static/logo.png]
+    R --> L["/static/logo.png"]
 ```
 
 ## 目录结构
