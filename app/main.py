@@ -212,6 +212,44 @@ def init_db():
         conn.execute("ALTER TABLE answers ADD COLUMN likes INTEGER NOT NULL DEFAULT 0")
     if "is_pinned" not in answer_cols:
         conn.execute("ALTER TABLE answers ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0")
+    # 点赞记录：谁给哪条回答点了赞（支持再次点击取消）
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answer_likes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            answer_id INTEGER NOT NULL,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (answer_id, user_id)
+        )
+        """
+    )
+    like_cols = {row["name"] for row in conn.execute("PRAGMA table_info(answer_likes)")}
+    if "user_id" not in like_cols:
+        # 兼容旧表（voter 字段）：迁移为 user_id
+        conn.execute("ALTER TABLE answer_likes RENAME TO answer_likes_old")
+        conn.execute(
+            """
+            CREATE TABLE answer_likes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                answer_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE (answer_id, user_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO answer_likes (answer_id, user_id, created_at)
+            SELECT answer_id, voter, created_at FROM answer_likes_old
+            """
+        )
+        conn.execute("DROP TABLE answer_likes_old")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_answer_likes_user "
+        "ON answer_likes (answer_id, user_id)"
+    )
     conn.commit()
     conn.close()
 
@@ -276,10 +314,12 @@ STYLE = """
   .link-btn.danger:hover { color: #dc2626; }
   .toggle-btn { background: none; border: none; color: #666; font-size: 13px; padding: 0 4px; cursor: pointer; text-decoration: underline; font-family: inherit; }
   .toggle-btn:hover { background: none; color: #2563eb; }
-  .like-btn { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 14px; filter: grayscale(1); opacity: 0.6; }
-  .like-btn:hover { background: none; filter: grayscale(0.3); opacity: 0.9; }
-  .like-btn.liked { filter: none; opacity: 1; }
-  .like-count { display: none; color: #999; font-size: 12px; margin-left: 2px; }
+  .like-btn { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 14px; filter: grayscale(1); opacity: 0.55; transition: filter 0.2s, opacity 0.2s, transform 0.2s; }
+  .like-btn:hover { background: none; filter: grayscale(0.4); opacity: 0.85; }
+  .like-btn.liked { filter: grayscale(1) sepia(1) saturate(6) hue-rotate(190deg) brightness(0.95); opacity: 1; transform: scale(1.08); }
+  .like-btn:disabled { cursor: default; }
+  .like-count { color: #94a3b8; font-size: 12px; margin-left: 2px; }
+  .like-count.liked { color: #2563eb; font-weight: 600; }
   .btn { display: inline-block; padding: 7px 12px; background: #16a34a; color: #fff; border-radius: 8px; font-size: 13px; text-decoration: none; }
   .btn:hover { background: #15803d; }
   td .actions { display: flex; gap: 6px; }
@@ -446,6 +486,25 @@ PAGE = """<!DOCTYPE html>
   {TIP}
   {CONTENT}
   </main>
+  <script>
+  (function () {
+    var SCROLL_KEY = "scrollPos";
+    document.addEventListener("submit", function () {
+      try {
+        sessionStorage.setItem(SCROLL_KEY, String(window.scrollY || window.pageYOffset || 0));
+      } catch (e) {}
+    }, true);
+    window.addEventListener("DOMContentLoaded", function () {
+      try {
+        var saved = sessionStorage.getItem(SCROLL_KEY);
+        if (saved !== null) {
+          sessionStorage.removeItem(SCROLL_KEY);
+          window.scrollTo(0, parseInt(saved, 10) || 0);
+        }
+      } catch (e) {}
+    });
+  })();
+  </script>
 </body>
 </html>"""
 
@@ -553,6 +612,17 @@ def get_printer_used(conn, printer):
     return row["used"] if row else 0.0
 
 
+def get_printer_recent_used(conn, printer, days=7):
+    """近 days 天（含今天）该打印机已通过 / 已完成预约的耗材合计。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(consumable), 0) AS used FROM bookings "
+        "WHERE status IN (?, ?) AND printer = ? "
+        "AND created_at >= datetime('now', 'localtime', ?)",
+        (STATUS_APPROVED, STATUS_COMPLETED, printer, f"-{days} days"),
+    ).fetchone()
+    return row["used"] if row else 0.0
+
+
 def deduct_printer_stock(conn, printer, grams):
     remaining = max(0.0, get_printer_remaining(conn, printer) - grams)
     conn.execute(
@@ -615,12 +685,12 @@ def smart_tip(conn):
         remaining = get_printer_remaining(conn, printer)
         if remaining >= 300:
             continue
-        daily = get_printer_used(conn, printer) / 7.0
+        daily = get_printer_recent_used(conn, printer, 7) / 7.0
         if daily > 0:
             days = fmt_num(remaining / daily)
-            detail = f"按近期消耗速度，预计 {days} 天后耗尽"
+            detail = f"按近 7 天消耗速度，预计 {days} 天后耗尽"
         else:
-            detail = "近期暂无消耗记录"
+            detail = "近 7 天暂无消耗记录"
         tips += (
             f'<p class="alert">⚠️ 智能预测：{printer_label(printer)}仅剩 '
             f"{fmt_grams(remaining)} 克，{detail}，请及时补充！</p>"
@@ -774,7 +844,7 @@ def report_form(keyword, question):
 # ---------- 同学互助问答板 ----------
 
 
-def qa_board_html(conn, qa_keyword="", is_admin=False, viewer=""):
+def qa_board_html(conn, qa_keyword="", is_admin=False, viewer="", voter=""):
     if qa_keyword:
         questions = conn.execute(
             """
@@ -799,6 +869,12 @@ def qa_board_html(conn, qa_keyword="", is_admin=False, viewer=""):
             items = '<p class="empty">暂无提问，快来问第一个问题吧。</p>'
     else:
         items = ""
+        liked_ids = {
+            row["answer_id"]
+            for row in conn.execute(
+                "SELECT answer_id FROM answer_likes WHERE user_id = ?", (voter,)
+            )
+        }
         for question in questions:
             question_id = question["id"]
             asker = escape(question["asker_name"])
@@ -833,6 +909,10 @@ def qa_board_html(conn, qa_keyword="", is_admin=False, viewer=""):
                     created = escape(answer["created_at"])
                     answer_id = answer["id"]
                     likes = answer["likes"]
+                    liked = answer_id in liked_ids
+                    like_cls = "like-btn liked" if liked else "like-btn"
+                    like_title = ' title="取消点赞"' if liked else ' title="点赞"'
+                    count_cls = "like-count liked" if liked else "like-count"
                     pin_mark = (
                         '<span class="tag pending">置顶回答</span> '
                         if answer["is_pinned"]
@@ -842,8 +922,8 @@ def qa_board_html(conn, qa_keyword="", is_admin=False, viewer=""):
                         '<div class="ans">'
                         f"{pin_mark}<b>{answerer}</b>：{text} "
                         f'<span class="meta">{created}</span> '
-                        f'<button type="button" class="like-btn" data-id="{answer_id}" onclick="likeAnswer(this)">👍</button>'
-                        f'<span class="like-count" id="like-count-{answer_id}">{likes}</span>'
+                        f'<button type="button" class="{like_cls}" data-id="{answer_id}"{like_title} onclick="likeAnswer(this)">👍</button>'
+                        f'<span class="{count_cls}" id="like-count-{answer_id}">{likes}</span>'
                     )
                     if is_admin:
                         pin_label = "取消置顶" if answer["is_pinned"] else "置顶"
@@ -917,13 +997,18 @@ def qa_board_html(conn, qa_keyword="", is_admin=False, viewer=""):
     like_js = (
         "<script>"
         "function likeAnswer(btn){"
-        "var id=btn.getAttribute('data-id');btn.disabled=true;"
+        "var id=btn.getAttribute('data-id');"
+        "if(btn.disabled){return;}"
+        "btn.disabled=true;"
         "fetch('/qa_like',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},"
         "body:'id='+encodeURIComponent(id)})"
         ".then(function(r){return r.json();})"
-        ".then(function(data){btn.classList.add('liked');"
+        ".then(function(data){"
+        "var liked=data.status==='liked';"
+        "btn.classList.toggle('liked',liked);btn.title=liked?'取消点赞':'点赞';"
         "var s=document.getElementById('like-count-'+id);"
-        "if(s){s.textContent=data.likes;s.style.display='inline';}})"
+        "if(s){s.textContent=data.new_likes;s.classList.toggle('liked',liked);}"
+        "btn.disabled=false;})"
         ".catch(function(){btn.disabled=false;});"
         "}"
         "</script>"
@@ -1101,7 +1186,9 @@ def student_content(session, msg="", ok=False, suggest=False, reply_html="", qa_
         "SELECT device, issue, status, created_at FROM maintenance ORDER BY id DESC"
     ).fetchall()
     assistant = student_assistant(conn, session, reply_html)
-    qa = qa_board_html(conn, qa_keyword, viewer=session["name"])
+    qa = qa_board_html(
+        conn, qa_keyword, viewer=session["name"], voter=session["account"]
+    )
     conn.close()
 
     stock_text = " ｜ ".join(f"{printer_label(p)} 剩余 {fmt_grams(g)} 克" for p, g in stocks)
@@ -1209,7 +1296,7 @@ def student_content(session, msg="", ok=False, suggest=False, reply_html="", qa_
 # ---------- 管理员页面 ----------
 
 
-def admin_content(msg="", ok=False, qa_keyword=""):
+def admin_content(session, msg="", ok=False, qa_keyword=""):
     conn = connect()
     rows = conn.execute(
         """
@@ -1235,7 +1322,9 @@ def admin_content(msg="", ok=False, qa_keyword=""):
         (EXP_PENDING,),
     ).fetchall()
     stocks = [(p, get_printer_remaining(conn, p), get_printer_used(conn, p)) for p in PRINTERS]
-    qa = qa_board_html(conn, qa_keyword, is_admin=True)
+    qa = qa_board_html(
+        conn, qa_keyword, is_admin=True, voter=session["account"]
+    )
     conn.close()
     device_options = "".join(f'<option value="{p}">{p}</option>' for p in PRINTERS)
     pending = sum(1 for row in rows if row["status"] == STATUS_PENDING)
@@ -1507,7 +1596,9 @@ async def index(request: Request):
             session, msg=msg, ok=ok, suggest=suggest, qa_keyword=qa_keyword
         )
     else:
-        content = admin_content(msg=msg, ok=ok, qa_keyword=qa_keyword)
+        content = admin_content(
+            session, msg=msg, ok=ok, qa_keyword=qa_keyword
+        )
 
     return HTMLResponse(render_page(session, content, tip))
 
@@ -2190,21 +2281,46 @@ async def qa_like(request: Request):
 
     raw = (await request.body()).decode("utf-8")
     answer_id = parse_qs(raw).get("id", [""])[0].strip()
-    likes = 0
+    if not answer_id.isdigit():
+        return JSONResponse({"status": "error", "new_likes": 0}, status_code=400)
 
-    if answer_id.isdigit():
-        conn = connect()
-        conn.execute(
-            "UPDATE answers SET likes = likes + 1 WHERE id = ?", (int(answer_id),)
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT likes FROM answers WHERE id = ?", (int(answer_id),)
-        ).fetchone()
-        likes = row["likes"] if row else 0
+    aid = int(answer_id)
+    user_id = session["account"]
+    conn = connect()
+    row = conn.execute("SELECT likes FROM answers WHERE id = ?", (aid,)).fetchone()
+    if row is None:
         conn.close()
+        return JSONResponse({"status": "error", "new_likes": 0}, status_code=404)
 
-    return JSONResponse({"likes": likes})
+    existing = conn.execute(
+        "SELECT id FROM answer_likes WHERE answer_id = ? AND user_id = ?",
+        (aid, user_id),
+    ).fetchone()
+
+    if existing:
+        # 已赞过：取消点赞
+        conn.execute("DELETE FROM answer_likes WHERE id = ?", (existing["id"],))
+        conn.execute(
+            "UPDATE answers SET likes = CASE WHEN likes > 0 THEN likes - 1 ELSE 0 END "
+            "WHERE id = ?",
+            (aid,),
+        )
+        status = "unliked"
+    else:
+        # 未赞过：新增点赞
+        conn.execute(
+            "INSERT INTO answer_likes (answer_id, user_id, created_at) VALUES (?, ?, ?)",
+            (aid, user_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.execute("UPDATE answers SET likes = likes + 1 WHERE id = ?", (aid,))
+        status = "liked"
+
+    conn.commit()
+    new_likes = conn.execute(
+        "SELECT likes FROM answers WHERE id = ?", (aid,)
+    ).fetchone()["likes"]
+    conn.close()
+    return JSONResponse({"status": status, "new_likes": new_likes, "likes": new_likes})
 
 
 @app.post("/qa_pin_answer")
@@ -2258,6 +2374,10 @@ async def qa_delete(request: Request):
 
     if qa_id.isdigit():
         conn = connect()
+        conn.execute(
+            "DELETE FROM answer_likes WHERE answer_id IN (SELECT id FROM answers WHERE question_id = ?)",
+            (int(qa_id),),
+        )
         conn.execute("DELETE FROM answers WHERE question_id = ?", (int(qa_id),))
         conn.execute("DELETE FROM questions WHERE id = ?", (int(qa_id),))
         conn.commit()
@@ -2279,6 +2399,9 @@ async def qa_delete_answer(request: Request):
 
     if answer_id.isdigit():
         conn = connect()
+        conn.execute(
+            "DELETE FROM answer_likes WHERE answer_id = ?", (int(answer_id),)
+        )
         conn.execute("DELETE FROM answers WHERE id = ?", (int(answer_id),))
         conn.commit()
         conn.close()
